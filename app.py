@@ -201,6 +201,10 @@ def make_backup():
 
 BASE_STYLE = """
 <style>
+@import url(
+'https://fonts.googleapis.com/css2?family=DotGothic16&family=Noto+Sans+JP:wght@400;500;700;900&display=swap'
+);
+
 * {
     box-sizing: border-box;
 }
@@ -225,11 +229,14 @@ body {
         ),
         var(--lavender);
     background-size: 100% 32px;
-    font-family: sans-serif;
+    font-family: "Noto Sans JP", sans-serif;
     line-height: 1.7;
 }
 
 header {
+    position: sticky;
+    top: 0;
+    z-index: 10;
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -240,13 +247,14 @@ header {
 }
 
 .logo {
+    font-family: "DotGothic16", sans-serif;
     font-size: 22px;
-    font-weight: 900;
     letter-spacing: .1em;
 }
 
 .header-note {
     color: var(--gray);
+    font-family: "DotGothic16", sans-serif;
     font-size: 11px;
 }
 
@@ -256,6 +264,7 @@ main {
 }
 
 .hero {
+    min-height: 360px;
     padding: 90px 0 70px;
     border-bottom: 2px solid var(--black);
 }
@@ -266,13 +275,16 @@ main {
     color: var(--white);
     background: var(--blue);
     border: 2px solid var(--black);
+    font-family: "DotGothic16", sans-serif;
     font-size: 12px;
     letter-spacing: .12em;
     box-shadow: 5px 5px 0 var(--black);
 }
 
 h1 {
+    max-width: 700px;
     margin: 25px 0 20px;
+    font-family: "DotGothic16", "Noto Sans JP", sans-serif;
     font-size: clamp(42px, 8vw, 90px);
     line-height: 1.08;
 }
@@ -282,11 +294,49 @@ h1 {
     color: var(--gray);
 }
 
+.hero-line {
+    display: block;
+    position: relative;
+    z-index: 1;
+    width: fit-content;
+}
+
+.hero-line::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 2px;
+    z-index: -1;
+    height: 10px;
+    transform: rotate(-2deg);
+}
+
+.hero-line-pink::after {
+    background: var(--pink);
+}
+
+.hero-line-blue::after {
+    background: var(--blue);
+}
+
 h2 {
+    display: flex;
+    align-items: center;
+    gap: 13px;
     margin: 65px 0 25px;
     padding-bottom: 13px;
     border-bottom: 2px solid var(--black);
+    font-family: "DotGothic16", "Noto Sans JP", sans-serif;
     font-size: 26px;
+}
+
+h2::before {
+    content: "";
+    width: 18px;
+    height: 18px;
+    background: var(--pink);
+    border: 2px solid var(--black);
 }
 
 form {
@@ -319,6 +369,14 @@ select {
 textarea {
     min-height: 125px;
     resize: vertical;
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+    outline: 4px solid var(--pink);
+    outline-offset: 2px;
+    border-color: var(--blue);
 }
 
 button,
@@ -402,14 +460,8 @@ button:hover,
     display: none;
 }
 
-.report-content {
-    padding: 20px 24px;
-    border-top: 2px solid var(--black);
-}
-
-.report-content p {
-    margin: 10px 0;
-    white-space: pre-wrap;
+.report-band summary:hover {
+    background: #f8f5ff;
 }
 
 .band-date,
@@ -427,10 +479,25 @@ button:hover,
     font-size: 22px;
 }
 
+.report-content {
+    padding: 20px 24px;
+    border-top: 2px solid var(--black);
+}
+
+.report-content p {
+    margin: 10px 0;
+    white-space: pre-wrap;
+}
+
 .admin-form {
     margin-top: 25px;
     padding: 18px;
     box-shadow: none;
+    border: 2px solid var(--black);
+}
+
+.admin-form p {
+    margin-bottom: 8px;
 }
 
 footer {
@@ -440,6 +507,7 @@ footer {
     background: var(--black);
     border-top: 8px solid var(--pink);
     text-align: center;
+    font-family: "DotGothic16", sans-serif;
     font-size: 12px;
 }
 
@@ -448,12 +516,18 @@ footer {
     margin: 45px auto;
 }
 
+.register-main h1 {
+    font-size: clamp(34px, 7vw, 64px);
+    line-height: 1.2;
+}
+
 @media (max-width: 700px) {
     .header-note {
         display: none;
     }
 
     .hero {
+        min-height: 430px;
         padding: 70px 0 60px;
     }
 
@@ -505,12 +579,7 @@ VIEW_LOGIN_HTML = f"""
 <form method="post">
 <p>
 閲覧用の合言葉<br>
-<input
-    type="password"
-    name="password"
-    required
-    autofocus
->
+<input type="password" name="password" required autofocus>
 </p>
 
 {{% if error %}}
@@ -619,8 +688,8 @@ INDEX_HTML = f"""
 <div class="hero-label">INFORMATION SHARING SYSTEM</div>
 
 <h1>
-<span>報告を、</span><br>
-<span>一つの場所へ。</span>
+<span class="hero-line hero-line-pink">報告を、</span>
+<span class="hero-line hero-line-blue">一つの場所へ。</span>
 </h1>
 
 <p class="hero-text">
@@ -665,17 +734,9 @@ INDEX_HTML = f"""
 
 <p>
 日付の範囲<br>
-<input
-    type="date"
-    name="start_date"
-    value="{{{{ start_date }}}}"
->
+<input type="date" name="start_date" value="{{{{ start_date }}}}">
 から
-<input
-    type="date"
-    name="end_date"
-    value="{{{{ end_date }}}}"
->
+<input type="date" name="end_date" value="{{{{ end_date }}}}">
 </p>
 
 <button type="submit">検索する →</button>
@@ -687,34 +748,15 @@ INDEX_HTML = f"""
 
 <form method="get" action="/">
 <input type="hidden" name="keyword" value="{{{{ keyword }}}}">
-<input
-    type="hidden"
-    name="department"
-    value="{{{{ selected_department }}}}"
->
-<input
-    type="hidden"
-    name="start_date"
-    value="{{{{ start_date }}}}"
->
-<input
-    type="hidden"
-    name="end_date"
-    value="{{{{ end_date }}}}"
->
+<input type="hidden" name="department" value="{{{{ selected_department }}}}">
+<input type="hidden" name="start_date" value="{{{{ start_date }}}}">
+<input type="hidden" name="end_date" value="{{{{ end_date }}}}">
 
 <select name="sort" onchange="this.form.submit()">
-<option
-    value="new"
-    {{% if sort == "new" %}}selected{{% endif %}}
->
+<option value="new" {{% if sort == "new" %}}selected{{% endif %}}>
 日付の新しい順
 </option>
-
-<option
-    value="old"
-    {{% if sort == "old" %}}selected{{% endif %}}
->
+<option value="old" {{% if sort == "old" %}}selected{{% endif %}}>
 日付の古い順
 </option>
 </select>
@@ -812,7 +854,6 @@ INDEX_HTML = f"""
 {{% endif %}}
 </div>
 </details>
-
 {{% else %}}
 <p>該当する報告はありません。</p>
 {{% endfor %}}
@@ -1081,8 +1122,8 @@ def register_report():
 
 
 @app.route("/hide/<int:report_id>", methods=["POST"])
-@require_admin_password
 @require_view_password
+@require_admin_password
 def hide_report(report_id):
     connection = get_connection()
 
@@ -1102,8 +1143,8 @@ def hide_report(report_id):
 
 
 @app.route("/restore/<int:report_id>", methods=["POST"])
-@require_admin_password
 @require_view_password
+@require_admin_password
 def restore_report(report_id):
     connection = get_connection()
 
@@ -1123,8 +1164,8 @@ def restore_report(report_id):
 
 
 @app.route("/backup", methods=["POST"])
-@require_admin_password
 @require_view_password
+@require_admin_password
 def backup_database():
     backup_name = make_backup()
 
