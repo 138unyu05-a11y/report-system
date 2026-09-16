@@ -7,20 +7,25 @@ from flask import (
     session,
     url_for,
 )
+import csv
+import io
+import json
 import os
 import re
-import shutil
 import secrets
-import sqlite3
 from datetime import datetime
 from functools import wraps
+
+import gspread
+from google.oauth2.service_account import Credentials
 
 
 app = Flask(__name__)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATABASE = os.path.join(BASE_DIR, "reports.db")
-BACKUP_FOLDER = os.path.join(BASE_DIR, "backups")
+
+# ============================================================
+# 基本設定
+# ============================================================
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 VIEW_PASSWORD = os.environ.get("VIEW_PASSWORD", "")
@@ -33,7 +38,15 @@ app.secret_key = os.environ.get(
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
 app.config["SESSION_PERMANENT"] = False
 
-os.makedirs(BACKUP_FOLDER, exist_ok=True)
+
+# GoogleスプレッドシートのID
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
+
+# Renderの環境変数に登録したサービスアカウントJSON
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get(
+    "GOOGLE_SERVICE_ACCOUNT_JSON",
+    "",
+).strip()
 
 
 FIELDS = (
@@ -49,37 +62,233 @@ FIELDS = (
 )
 
 
-def get_connection():
-    connection = sqlite3.connect(DATABASE)
-    connection.row_factory = sqlite3.Row
-    return connection
+SHEET_HEADERS = [
+    "id",
+    "department",
+    "report_date",
+    "reporter",
+    "subject",
+    "summary",
+    "details",
+    "issues",
+    "actions",
+    "future_plans",
+    "hidden",
+    "created_at",
+]
 
 
-def create_database():
-    connection = get_connection()
+# ============================================================
+# Googleスプレッドシート接続
+# ============================================================
 
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            department TEXT NOT NULL DEFAULT '',
-            report_date TEXT NOT NULL DEFAULT '',
-            reporter TEXT NOT NULL DEFAULT '',
-            subject TEXT NOT NULL DEFAULT '',
-            summary TEXT NOT NULL DEFAULT '',
-            details TEXT NOT NULL DEFAULT '',
-            issues TEXT NOT NULL DEFAULT '',
-            actions TEXT NOT NULL DEFAULT '',
-            future_plans TEXT NOT NULL DEFAULT '',
-            hidden INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT ''
+def get_worksheet():
+    """
+    Googleスプレッドシートの1枚目を取得する。
+    1行目が空の場合は、必要な見出しを自動作成する。
+    """
+
+    if not GOOGLE_SHEET_ID:
+        raise RuntimeError(
+            "環境変数 GOOGLE_SHEET_ID が設定されていません。"
         )
-        """
+
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise RuntimeError(
+            "環境変数 GOOGLE_SERVICE_ACCOUNT_JSON が設定されていません。"
+        )
+
+    try:
+        service_account_info = json.loads(
+            GOOGLE_SERVICE_ACCOUNT_JSON
+        )
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            "GOOGLE_SERVICE_ACCOUNT_JSON のJSON形式が正しくありません。"
+        ) from error
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    credentials = Credentials.from_service_account_info(
+        service_account_info,
+        scopes=scopes,
     )
 
-    connection.commit()
-    connection.close()
+    client = gspread.authorize(credentials)
 
+    spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+    worksheet = spreadsheet.sheet1
+
+    current_headers = worksheet.row_values(1)
+
+    if current_headers != SHEET_HEADERS:
+        if not current_headers:
+            worksheet.update(
+                "A1:L1",
+                [SHEET_HEADERS],
+            )
+        else:
+            worksheet.insert_row(
+                SHEET_HEADERS,
+                1,
+            )
+
+    return worksheet
+
+
+def row_to_report(row):
+    """
+    Googleスプレッドシートの1行を、
+    既存HTMLで使える辞書形式に変換する。
+    """
+
+    report = {}
+
+    for index, field in enumerate(SHEET_HEADERS):
+        if index < len(row):
+            report[field] = row[index]
+        else:
+            report[field] = ""
+
+    try:
+        report["id"] = int(report["id"])
+    except (TypeError, ValueError):
+        report["id"] = 0
+
+    try:
+        report["hidden"] = int(report["hidden"])
+    except (TypeError, ValueError):
+        report["hidden"] = 0
+
+    return report
+
+
+def get_all_reports():
+    """
+    Googleスプレッドシートに保存されている全報告を取得する。
+    """
+
+    worksheet = get_worksheet()
+    rows = worksheet.get_all_values()
+
+    if len(rows) <= 1:
+        return []
+
+    reports = []
+
+    for row in rows[1:]:
+        if not any(str(value).strip() for value in row):
+            continue
+
+        reports.append(row_to_report(row))
+
+    return reports
+
+
+def get_next_report_id(reports):
+    """
+    次に使うIDを作成する。
+    """
+
+    ids = []
+
+    for report in reports:
+        try:
+            ids.append(int(report.get("id", 0)))
+        except (TypeError, ValueError):
+            pass
+
+    if not ids:
+        return 1
+
+    return max(ids) + 1
+
+
+def report_to_row(report):
+    """
+    報告データをGoogleスプレッドシートの行に変換する。
+    """
+
+    return [
+        str(report.get("id", "")),
+        str(report.get("department", "")),
+        str(report.get("report_date", "")),
+        str(report.get("reporter", "")),
+        str(report.get("subject", "")),
+        str(report.get("summary", "")),
+        str(report.get("details", "")),
+        str(report.get("issues", "")),
+        str(report.get("actions", "")),
+        str(report.get("future_plans", "")),
+        str(report.get("hidden", 0)),
+        str(report.get("created_at", "")),
+    ]
+
+
+def find_sheet_row_by_id(report_id):
+    """
+    IDからGoogleスプレッドシート上の行番号を探す。
+    1行目は見出しなので、データは2行目から始まる。
+    """
+
+    worksheet = get_worksheet()
+    rows = worksheet.get_all_values()
+
+    for row_number, row in enumerate(rows[1:], start=2):
+        if not row:
+            continue
+
+        try:
+            current_id = int(row[0])
+        except (TypeError, ValueError, IndexError):
+            continue
+
+        if current_id == report_id:
+            return row_number
+
+    return None
+
+
+def append_report(report):
+    """
+    新しい報告を末尾に追加する。
+    """
+
+    worksheet = get_worksheet()
+    worksheet.append_row(
+        report_to_row(report),
+        value_input_option="USER_ENTERED",
+    )
+
+
+def update_report_hidden(report_id, hidden):
+    """
+    報告の非表示状態を変更する。
+    """
+
+    row_number = find_sheet_row_by_id(report_id)
+
+    if row_number is None:
+        return False
+
+    worksheet = get_worksheet()
+
+    # hidden列は11列目、K列
+    worksheet.update_cell(
+        row_number,
+        11,
+        str(hidden),
+    )
+
+    return True
+
+
+# ============================================================
+# 入力値の処理
+# ============================================================
 
 def normalize_date(value):
     if not value:
@@ -131,6 +340,10 @@ def get_form_values():
     return values
 
 
+# ============================================================
+# 認証
+# ============================================================
+
 def require_view_password(function):
     @wraps(function)
     def wrapper(*args, **kwargs):
@@ -167,37 +380,28 @@ def require_admin_password(function):
                 500,
             )
 
-        password = request.form.get("password", "")
+        password = request.form.get(
+            "password",
+            "",
+        )
 
         if not secrets.compare_digest(
             password,
             ADMIN_PASSWORD,
         ):
-            return "管理者パスワードが違います。", 403
+            return (
+                "管理者パスワードが違います。",
+                403,
+            )
 
         return function(*args, **kwargs)
 
     return wrapper
 
 
-def make_backup():
-    if not os.path.exists(DATABASE):
-        return ""
-
-    timestamp = datetime.now().strftime(
-        "%Y%m%d_%H%M%S"
-    )
-
-    backup_name = f"reports_{timestamp}.db"
-    backup_path = os.path.join(
-        BACKUP_FOLDER,
-        backup_name,
-    )
-
-    shutil.copy2(DATABASE, backup_path)
-
-    return backup_name
-
+# ============================================================
+# 表示用CSS
+# ============================================================
 
 BASE_STYLE = """
 <style>
@@ -561,7 +765,9 @@ footer {
 }
 </style>
 """
-
+# ============================================================
+# 閲覧認証画面
+# ============================================================
 
 VIEW_LOGIN_HTML = f"""
 <!DOCTYPE html>
@@ -593,6 +799,10 @@ VIEW_LOGIN_HTML = f"""
 </html>
 """
 
+
+# ============================================================
+# 登録画面
+# ============================================================
 
 REGISTER_HTML = f"""
 <!DOCTYPE html>
@@ -668,6 +878,10 @@ REGISTER_HTML = f"""
 """
 
 
+# ============================================================
+# 一覧画面
+# ============================================================
+
 INDEX_HTML = f"""
 <!DOCTYPE html>
 <html lang="ja">
@@ -678,6 +892,7 @@ INDEX_HTML = f"""
 {BASE_STYLE}
 </head>
 <body>
+
 <header>
 <div class="logo">REPORTS_</div>
 <div class="header-note">DEPARTMENT REPORT ARCHIVE</div>
@@ -721,12 +936,12 @@ INDEX_HTML = f"""
 <option value="">すべての部署</option>
 {{% for item in departments %}}
 <option
-    value="{{{{ item['department'] }}}}"
-    {{% if selected_department == item['department'] %}}
+    value="{{{{ item }}}}"
+    {{% if selected_department == item %}}
     selected
     {{% endif %}}
 >
-{{{{ item['department'] }}}}
+{{{{ item }}}}
 </option>
 {{% endfor %}}
 </select>
@@ -734,9 +949,17 @@ INDEX_HTML = f"""
 
 <p>
 日付の範囲<br>
-<input type="date" name="start_date" value="{{{{ start_date }}}}">
+<input
+    type="date"
+    name="start_date"
+    value="{{{{ start_date }}}}"
+>
 から
-<input type="date" name="end_date" value="{{{{ end_date }}}}">
+<input
+    type="date"
+    name="end_date"
+    value="{{{{ end_date }}}}"
+>
 </p>
 
 <button type="submit">検索する →</button>
@@ -747,16 +970,44 @@ INDEX_HTML = f"""
 <strong>報告の並び順：</strong>
 
 <form method="get" action="/">
-<input type="hidden" name="keyword" value="{{{{ keyword }}}}">
-<input type="hidden" name="department" value="{{{{ selected_department }}}}">
-<input type="hidden" name="start_date" value="{{{{ start_date }}}}">
-<input type="hidden" name="end_date" value="{{{{ end_date }}}}">
+<input
+    type="hidden"
+    name="keyword"
+    value="{{{{ keyword }}}}"
+>
+<input
+    type="hidden"
+    name="department"
+    value="{{{{ selected_department }}}}"
+>
+<input
+    type="hidden"
+    name="start_date"
+    value="{{{{ start_date }}}}"
+>
+<input
+    type="hidden"
+    name="end_date"
+    value="{{{{ end_date }}}}"
+>
+<input
+    type="hidden"
+    name="show_hidden"
+    value="{{{{ "1" if show_hidden else "" }}}}"
+>
 
 <select name="sort" onchange="this.form.submit()">
-<option value="new" {{% if sort == "new" %}}selected{{% endif %}}>
+<option
+    value="new"
+    {{% if sort == "new" %}}selected{{% endif %}}
+>
 日付の新しい順
 </option>
-<option value="old" {{% if sort == "old" %}}selected{{% endif %}}>
+
+<option
+    value="old"
+    {{% if sort == "old" %}}selected{{% endif %}}
+>
 日付の古い順
 </option>
 </select>
@@ -770,15 +1021,15 @@ INDEX_HTML = f"""
 <details class="report-band">
 <summary>
 <span class="band-date">
-{{{{ report['report_date'] or "日付未入力" }}}}
+{{{{ report["report_date"] or "日付未入力" }}}}
 </span>
 
 <span class="band-department">
-{{{{ report['department'] or "部署未入力" }}}}
+{{{{ report["department"] or "部署未入力" }}}}
 </span>
 
 <span class="band-subject">
-{{{{ report['subject'] or "件名なし" }}}}
+{{{{ report["subject"] or "件名なし" }}}}
 </span>
 
 <span class="band-arrow">＋</span>
@@ -787,38 +1038,38 @@ INDEX_HTML = f"""
 <div class="report-content">
 <p>
 <strong>報告者：</strong>
-{{{{ report['reporter'] or "未入力" }}}}
+{{{{ report["reporter"] or "未入力" }}}}
 </p>
 
 <p>
 <strong>概要：</strong>
-{{{{ report['summary'] or "未入力" }}}}
+{{{{ report["summary"] or "未入力" }}}}
 </p>
 
 <p>
 <strong>詳細内容：</strong>
-{{{{ report['details'] or "未入力" }}}}
+{{{{ report["details"] or "未入力" }}}}
 </p>
 
 <p>
 <strong>課題：</strong>
-{{{{ report['issues'] or "未入力" }}}}
+{{{{ report["issues"] or "未入力" }}}}
 </p>
 
 <p>
 <strong>対応内容：</strong>
-{{{{ report['actions'] or "未入力" }}}}
+{{{{ report["actions"] or "未入力" }}}}
 </p>
 
 <p>
 <strong>今後の予定：</strong>
-{{{{ report['future_plans'] or "未入力" }}}}
+{{{{ report["future_plans"] or "未入力" }}}}
 </p>
 
-{{% if report['hidden'] == 0 %}}
+{{% if report["hidden"] == 0 %}}
 <form
     method="post"
-    action="/hide/{{{{ report['id'] }}}}"
+    action="/hide/{{{{ report["id"] }}}}"
     class="admin-form"
 >
 <p>この報告を非表示にする</p>
@@ -837,7 +1088,7 @@ INDEX_HTML = f"""
 
 <form
     method="post"
-    action="/restore/{{{{ report['id'] }}}}"
+    action="/restore/{{{{ report["id"] }}}}"
     class="admin-form"
 >
 <p>この報告を表示に戻す</p>
@@ -851,12 +1102,12 @@ INDEX_HTML = f"""
 
 <button type="submit">表示に戻す</button>
 </form>
-{{% endif %}}
+{{% endif %}
 </div>
 </details>
 {{% else %}}
 <p>該当する報告はありません。</p>
-{{% endfor %}}
+{{% endfor %}
 </div>
 
 <h2>データを保存</h2>
@@ -881,10 +1132,15 @@ INDEX_HTML = f"""
 <footer>
 REPORTS_ / INFORMATION SHARING SYSTEM
 </footer>
+
 </body>
 </html>
 """
 
+
+# ============================================================
+# 閲覧認証
+# ============================================================
 
 @app.route("/view-login", methods=["GET", "POST"])
 def view_login():
@@ -894,7 +1150,10 @@ def view_login():
             error="",
         )
 
-    password = request.form.get("password", "")
+    password = request.form.get(
+        "password",
+        "",
+    )
 
     if not VIEW_PASSWORD:
         return (
@@ -906,20 +1165,30 @@ def view_login():
         password,
         VIEW_PASSWORD,
     ):
-        return render_template_string(
-            VIEW_LOGIN_HTML,
-            error="合言葉が違います。",
-        ), 403
+        return (
+            render_template_string(
+                VIEW_LOGIN_HTML,
+                error="合言葉が違います。",
+            ),
+            403,
+        )
 
     session["view_authenticated"] = True
 
-    next_url = request.args.get("next", "/")
+    next_url = request.args.get(
+        "next",
+        "/",
+    )
 
     if not next_url.startswith("/"):
         next_url = "/"
 
     return redirect(next_url)
 
+
+# ============================================================
+# 一覧・検索
+# ============================================================
 
 @app.route("/", methods=["GET"])
 @require_view_password
@@ -949,102 +1218,79 @@ def index():
         "new",
     ).strip()
 
-    show_hidden = request.args.get(
-        "show_hidden",
-        "",
-    ) == "1"
+    if sort not in ("new", "old"):
+        sort = "new"
 
-    sql = """
-        SELECT
-            id,
-            department,
+    show_hidden = (
+        request.args.get(
+            "show_hidden",
+            "",
+        )
+        == "1"
+    )
+
+    all_reports = get_all_reports()
+
+    departments = sorted(
+        {
+            report["department"]
+            for report in all_reports
+            if report["department"]
+        }
+    )
+
+    reports = []
+
+    for report in all_reports:
+        if not show_hidden and report["hidden"] == 1:
+            continue
+
+        if keyword:
+            searchable_text = " ".join(
+                [
+                    report["subject"],
+                    report["summary"],
+                    report["details"],
+                    report["issues"],
+                    report["actions"],
+                    report["future_plans"],
+                ]
+            ).lower()
+
+            if keyword.lower() not in searchable_text:
+                continue
+
+        if department:
+            if report["department"] != department:
+                continue
+
+        if start_date:
+            report_date = report["report_date"]
+
+            if not report_date or report_date < start_date:
+                continue
+
+        if end_date:
+            report_date = report["report_date"]
+
+            if not report_date or report_date > end_date:
+                continue
+
+        reports.append(report)
+
+    def sort_key(report):
+        report_date = report["report_date"] or "9999-99-99"
+        report_id = report["id"]
+
+        return (
             report_date,
-            reporter,
-            subject,
-            summary,
-            details,
-            issues,
-            actions,
-            future_plans,
-            hidden
-        FROM reports
-        WHERE 1 = 1
-    """
+            report_id,
+        )
 
-    params = []
-
-    if not show_hidden:
-        sql += " AND hidden = 0"
-
-    if keyword:
-        sql += """
-            AND (
-                subject LIKE ?
-                OR summary LIKE ?
-                OR details LIKE ?
-                OR issues LIKE ?
-                OR actions LIKE ?
-                OR future_plans LIKE ?
-            )
-        """
-
-        word = f"%{keyword}%"
-        params.extend([word] * 6)
-
-    if department:
-        sql += " AND department = ?"
-        params.append(department)
-
-    if start_date:
-        sql += " AND report_date >= ?"
-        params.append(start_date)
-
-    if end_date:
-        sql += " AND report_date <= ?"
-        params.append(end_date)
-
-    if sort == "old":
-        sql += """
-            ORDER BY
-                CASE
-                    WHEN report_date = ''
-                    OR report_date IS NULL
-                    THEN 1
-                    ELSE 0
-                END,
-                report_date ASC,
-                id ASC
-        """
-    else:
-        sql += """
-            ORDER BY
-                CASE
-                    WHEN report_date = ''
-                    OR report_date IS NULL
-                    THEN 1
-                    ELSE 0
-                END,
-                report_date DESC,
-                id DESC
-        """
-
-    connection = get_connection()
-
-    reports = connection.execute(
-        sql,
-        params,
-    ).fetchall()
-
-    departments = connection.execute(
-        """
-        SELECT DISTINCT department
-        FROM reports
-        WHERE department != ''
-        ORDER BY department
-        """
-    ).fetchall()
-
-    connection.close()
+    reports.sort(
+        key=sort_key,
+        reverse=(sort == "new"),
+    )
 
     return render_template_string(
         INDEX_HTML,
@@ -1058,6 +1304,10 @@ def index():
         show_hidden=show_hidden,
     )
 
+
+# ============================================================
+# 報告登録
+# ============================================================
 
 @app.route("/register", methods=["GET", "POST"])
 @require_view_password
@@ -1078,119 +1328,165 @@ def register_report():
 
     for field, label in required_fields.items():
         if not values[field]:
-            return f"{label}を入力してください。", 400
+            return (
+                f"{label}を入力してください。",
+                400,
+            )
 
-    connection = get_connection()
+    reports = get_all_reports()
 
-    connection.execute(
-        """
-        INSERT INTO reports (
-            department,
-            report_date,
-            reporter,
-            subject,
-            summary,
-            details,
-            issues,
-            actions,
-            future_plans,
-            hidden,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
-        """,
-        (
-            values["department"],
-            values["report_date"],
-            values["reporter"],
-            values["subject"],
-            values["summary"],
-            values["details"],
-            values["issues"],
-            values["actions"],
-            values["future_plans"],
-            datetime.now().isoformat(
-                timespec="seconds"
-            ),
+    report = {
+        "id": get_next_report_id(reports),
+        "department": values["department"],
+        "report_date": values["report_date"],
+        "reporter": values["reporter"],
+        "subject": values["subject"],
+        "summary": values["summary"],
+        "details": values["details"],
+        "issues": values["issues"],
+        "actions": values["actions"],
+        "future_plans": values["future_plans"],
+        "hidden": 0,
+        "created_at": datetime.now().isoformat(
+            timespec="seconds"
         ),
-    )
+    }
 
-    connection.commit()
-    connection.close()
+    append_report(report)
 
     return redirect("/")
+# ============================================================
+# 報告を非表示にする
+# ============================================================
 
-
-@app.route("/hide/<int:report_id>", methods=["POST"])
+@app.route(
+    "/hide/<int:report_id>",
+    methods=["POST"],
+)
 @require_view_password
 @require_admin_password
 def hide_report(report_id):
-    connection = get_connection()
-
-    connection.execute(
-        """
-        UPDATE reports
-        SET hidden = 1
-        WHERE id = ?
-        """,
-        (report_id,),
+    updated = update_report_hidden(
+        report_id,
+        1,
     )
 
-    connection.commit()
-    connection.close()
+    if not updated:
+        return (
+            "指定された報告が見つかりません。",
+            404,
+        )
 
     return redirect("/")
 
 
-@app.route("/restore/<int:report_id>", methods=["POST"])
+# ============================================================
+# 報告を復元する
+# ============================================================
+
+@app.route(
+    "/restore/<int:report_id>",
+    methods=["POST"],
+)
 @require_view_password
 @require_admin_password
 def restore_report(report_id):
-    connection = get_connection()
-
-    connection.execute(
-        """
-        UPDATE reports
-        SET hidden = 0
-        WHERE id = ?
-        """,
-        (report_id,),
+    updated = update_report_hidden(
+        report_id,
+        0,
     )
 
-    connection.commit()
-    connection.close()
+    if not updated:
+        return (
+            "指定された報告が見つかりません。",
+            404,
+        )
 
     return redirect("/?show_hidden=1")
 
 
-@app.route("/backup", methods=["POST"])
+# ============================================================
+# Googleスプレッドシートのバックアップ
+# ============================================================
+
+@app.route(
+    "/backup",
+    methods=["POST"],
+)
 @require_view_password
 @require_admin_password
 def backup_database():
-    backup_name = make_backup()
+    reports = get_all_reports()
 
-    if not backup_name:
-        return "バックアップ対象がありません。", 404
+    if not reports:
+        return (
+            "バックアップ対象がありません。",
+            404,
+        )
 
-    backup_path = os.path.join(
-        BACKUP_FOLDER,
-        backup_name,
+    output = io.StringIO(
+        newline=""
+    )
+
+    writer = csv.writer(
+        output
+    )
+
+    writer.writerow(SHEET_HEADERS)
+
+    for report in reports:
+        writer.writerow(
+            report_to_row(report)
+        )
+
+    memory_file = io.BytesIO(
+        output.getvalue().encode(
+            "utf-8-sig"
+        )
+    )
+
+    timestamp = datetime.now().strftime(
+        "%Y%m%d_%H%M%S"
+    )
+
+    backup_name = (
+        f"reports_backup_{timestamp}.csv"
     )
 
     return send_file(
-        backup_path,
+        memory_file,
         as_attachment=True,
         download_name=backup_name,
+        mimetype="text/csv",
     )
 
 
+# ============================================================
+# エラー処理
+# ============================================================
+
 @app.errorhandler(413)
 def request_entity_too_large(error):
-    return "送信データが大きすぎます。", 413
+    return (
+        "送信データが大きすぎます。",
+        413,
+    )
 
 
-create_database()
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    app.logger.exception(error)
 
+    return (
+        "サーバー内部でエラーが発生しました。"
+        "Renderのログを確認してください。",
+        500,
+    )
+
+
+# ============================================================
+# ローカル起動
+# ============================================================
 
 if __name__ == "__main__":
     app.run(
